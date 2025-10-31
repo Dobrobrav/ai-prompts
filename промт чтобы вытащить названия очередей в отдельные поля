@@ -1,0 +1,196 @@
+# Промт для ИИ-исполнителя
+
+Ты — инженер, вносящий правки в проекты на Python (FastAPI, aio\_pika, Celery и пр.), чтобы стандартизировать логи очередей. Цель — в существующие места логирования добавить **структурированные поля** по минимальной схеме:
+
+* `event.action` ∈ {`publish`, `consume`, `rpc.request`, `rpc.response`}
+* `labels.queue` — имя очереди, с которой действие связано “прямо сейчас”
+* `labels.reply_to` — только для RPC-кейсов (куда придёт/куда отправить ответ)
+
+## 0) Глобальные правила
+
+1. **Не ломай формат логов**: если проект уже логирует JSON — добавляй поля в существующий объект (dict → затем сериализация). Если текстовые логи — переведи конкретные вызовы в структурированный `dict` и логируй одной записью.
+2. **Не придумывай значения**: бери имена очередей из уже используемых переменных/конфигов (например: `queue_name`, `routing_key`, `message.reply_to`, `CONTEXT_RESULT_QUEUE`, `settings.X`).
+3. **Не переименовывай поля, не меняй смысл**: добавляй только недостающие `event.action`, `labels.queue`, `labels.reply_to` по правилам ниже.
+4. **Минимум — всегда** логируй `labels.queue`. `labels.reply_to` — только когда это RPC.
+5. **Повторяй лог в точке действия**: для publish — сразу после фактической публикации; для consume — при получении сообщения; для rpc.response — при отправке ответа.
+
+## 1) Как определить `event.action` и поля
+
+### A. Обычная очередь (не RPC)
+
+* Публикуем в очередь → `event.action = "publish"`, `labels.queue = <целевые_очереди>`
+* Потребляем из очереди → `event.action = "consume"`, `labels.queue = <источник>`
+
+### B. RPC-клиент
+
+* Отправка запроса (в `queue1`, ожидаем ответ в `queue2`):
+
+  * `event.action = "rpc.request"`
+  * `labels.queue = queue1`
+  * `labels.reply_to = queue2` (из `properties.reply_to`/конфига)
+* Получили ответ (из `queue2`):
+
+  * `event.action = "rpc.response"`
+  * `labels.queue = queue2`
+
+### C. RPC-сервер
+
+* Принял запрос (из `queue1`, отвечать в `queue2`):
+
+  * `event.action = "consume"`
+  * `labels.queue = queue1`
+  * `labels.reply_to = queue2` (берём из `incoming_message.reply_to`/headers)
+* Отправил ответ (в `queue2`):
+
+  * `event.action = "rpc.response"`
+  * `labels.queue = queue2`
+
+## 2) Где искать места для правок (эвристика)
+
+Ищи участки кода, где:
+
+* Идёт публикация/отправка: `channel.basic_publish`, `aio_pika.Channel.default_exchange.publish`, `queue.publish`, абстракции “producer.send…”.
+* Идёт потребление: обработчики/коллбеки `on_message`, `queue.consume`, декораторы `@consumer`, `@app.task` (Celery) — место входа в обработчик.
+* Используется `reply_to`, `correlation_id`, вызовы, похожие на RPC.
+* Уже логируют строку с `queue=`/`routing_key=` — замени/дополни на структурированный лог.
+
+## 3) Примеры правок (Python / aio\_pika)
+
+### Publish (обычный)
+
+```python
+await exchange.publish(message, routing_key=queue_name)
+logger.info({
+    "event": {"action": "publish"},
+    "labels": {"queue": queue_name},
+    "message_id": getattr(message, "message_id", None),
+})
+```
+
+### Consume (обычный)
+
+```python
+async with message.process():
+    logger.info({
+        "event": {"action": "consume"},
+        "labels": {"queue": queue.name},  # или известное имя
+        "message_id": getattr(message, "message_id", None),
+    })
+    # ... обработка ...
+```
+
+### RPC-клиент: запрос и получение ответа
+
+```python
+# отправка запроса
+props = aio_pika.Message(reply_to=reply_queue, correlation_id=cid, body=payload)
+await exchange.publish(props, routing_key=request_queue)
+logger.info({
+    "event": {"action": "rpc.request"},
+    "labels": {"queue": request_queue, "reply_to": reply_queue},
+    "correlation_id": cid,
+})
+
+# получение ответа
+async with message.process():
+    logger.info({
+        "event": {"action": "rpc.response"},
+        "labels": {"queue": message.routing_key or reply_queue},
+        "correlation_id": message.correlation_id,
+    })
+```
+
+### RPC-сервер: приём и ответ
+
+```python
+# приём запроса
+async with message.process():
+    reply_to = message.reply_to
+    logger.info({
+        "event": {"action": "consume"},
+        "labels": {"queue": request_queue, "reply_to": reply_to},
+        "correlation_id": message.correlation_id,
+    })
+    # ... сформировать ответ ...
+    await exchange.publish(response_msg, routing_key=reply_to)
+    logger.info({
+        "event": {"action": "rpc.response"},
+        "labels": {"queue": reply_to},
+        "correlation_id": message.correlation_id,
+    })
+```
+
+> Примечания:
+>
+> * Если вместо `exchange.publish` используется `queue.publish` — логика та же.
+> * Если имя очереди известно только из конфига (например, `settings.CONTEXT_RESULT_QUEUE`) — используй его.
+
+## 4) Миграция от строковых логов к структурированным
+
+Если видишь такое:
+
+```python
+logger.info(f"[MQ] publish queue={queue_name} ...")
+```
+
+замени на:
+
+```python
+logger.info({
+    "event": {"action": "publish"},
+    "labels": {"queue": queue_name},
+})
+```
+
+Сохрани дополнительные поля (track\_id, request\_id, tenant, и т.д.) на верхнем уровне того же объекта.
+
+## 5) Проверочные кейсы (добавь/исправь логи)
+
+1. **Обычный producer → обычный consumer**
+
+   * Producer: одна запись с `publish` и `labels.queue=<целевое>`
+   * Consumer: запись с `consume` и `labels.queue=<источник>`
+
+2. **RPC клиент ↔ сервер**
+
+   * Клиент (запрос): `rpc.request` + `labels.queue=<queue1>` + `labels.reply_to=<queue2>`
+   * Сервер (получил): `consume` + `labels.queue=<queue1>` + `labels.reply_to=<queue2>`
+   * Сервер (ответил): `rpc.response` + `labels.queue=<queue2>`
+   * Клиент (получил ответ): `rpc.response` + `labels.queue=<queue2>`
+
+3. **Отсутствует reply\_to в не-RPC** — не добавляй `labels.reply_to`.
+
+## 6) Требования к качеству
+
+* Одна лог-запись на одно действие. Не дублируй.
+* Не меняй уровни логирования без необходимости (оставь `info`, если так и было).
+* Не трогай ретраи/ack/nack — кроме добавления логов вокруг них, если они связаны с действием над очередью.
+* Ключи строго: `event.action`, `labels.queue`, `labels.reply_to` (snake\_case не использовать в этих ключах).
+* Все изменения покрыть локальным прогоном (линтер/тесты, если есть).
+
+## 7) Что не делать
+
+* Не добавляй `exchange`, `routing_key` и т.п., если их ранее не было — это **расширение**, оно опционально.
+* Не логируй `reply_to` в обычных кейсах.
+* Не выдумывай имена очередей.
+
+## 8) Короткая «шпаргалка»
+
+| Кейс               | event.action   | labels.queue    | labels.reply\_to |
+| ------------------ | -------------- | --------------- | ---------------- |
+| Publish (обычный)  | `publish`      | целевая         | —                |
+| Consume (обычный)  | `consume`      | источник        | —                |
+| RPC-клиент: запрос | `rpc.request`  | очередь запроса | очередь ответа   |
+| RPC-клиент: ответ  | `rpc.response` | очередь ответа  | —                |
+| RPC-сервер: запрос | `consume`      | очередь запроса | очередь ответа   |
+| RPC-сервер: ответ  | `rpc.response` | очередь ответа  | —                |
+
+Готово. Хочешь, я сразу внесу правки в показанные тобой файлы (AsyncRabbitMQManager, handle\_message\_from\_rabbit) по этой схеме?
+
+
+
+
+Уточнения:
+ * ты не создаешь новые логи. Ты трогаешь существующие.
+ * следи чтобы в логах не было дублирования (если ты добавил какое-то поле, то его не должно быть в основном тексте лога)
+ * ты трогаешь только те файлы, в которых изначально есть логи, куда пишется название очередей
